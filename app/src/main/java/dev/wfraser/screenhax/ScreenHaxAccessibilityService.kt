@@ -7,15 +7,21 @@ import android.content.Intent.FLAG_ACTIVITY_NEW_TASK
 import android.graphics.Path
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
+import androidx.annotation.GuardedBy
 import java.time.Duration
+import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.thread
+import kotlin.concurrent.withLock
 
 class ScreenHaxAccessibilityService : AccessibilityService() {
-    val tag = "ScreenHaxAccessibilityService"
-    val eventInterval = Duration.ofSeconds(30)
+    private val tag = "ScreenHaxAccessibilityService"
+    private val eventInterval = Duration.ofSeconds(30)
 
-    @Volatile
-    var enabled = true
+    private val lock = ReentrantLock()
+    private val cv = lock.newCondition()
+
+    @GuardedBy("lock")
+    private var enabled = true
 
     companion object {
         @Volatile
@@ -37,7 +43,7 @@ class ScreenHaxAccessibilityService : AccessibilityService() {
     override fun onUnbind(intent: Intent?): Boolean {
         Log.i(tag, "onUnbind")
         toast("ScreenHax disabled")
-        enabled = false
+        setEnabled(false)
         return super.onUnbind(intent)
     }
 
@@ -48,6 +54,18 @@ class ScreenHaxAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
     }
 
+    fun setEnabled(enabled: Boolean) {
+        lock.withLock {
+            this.enabled = enabled
+            cv.signalAll()
+        }
+    }
+
+    fun toggleEnabled() = lock.withLock {
+        setEnabled(!enabled)
+        enabled
+    }
+
     private fun toast(message: String) {
         startActivity(Intent(this, MainActivity::class.java).apply {
             addFlags(FLAG_ACTIVITY_NEW_TASK)
@@ -55,41 +73,51 @@ class ScreenHaxAccessibilityService : AccessibilityService() {
         })
     }
 
+    /**
+     * Sleep for [eventInterval] or until the value of [enabled] changes.
+     * @return the current value of [enabled]
+     */
+    private fun sleep() = lock.withLock {
+        cv.awaitNanos(eventInterval.toNanos())
+        enabled
+    }
+
+    /**
+     * Start a thread to inject touch events every [eventInterval] while [enabled] is true.
+     */
     private fun startInjector() {
         Log.i(tag, "starting injector")
-        enabled = true
+        setEnabled(true)
         thread(name = "touchInjector") {
-            for (i in generateSequence { Thread.sleep(eventInterval.toMillis()) }) {
-                if (!enabled) {
-                    break
-                }
-
-                val desc = GestureDescription.Builder().apply {
-                    addStroke(
-                        GestureDescription.StrokeDescription(
-                            Path().apply { moveTo(0F, 0F) },
-                            0,
-                            1,
-                        )
-                    )
-                }.build()
-
-                val cb = object : GestureResultCallback() {
-                    override fun onCompleted(gestureDescription: GestureDescription?) {
-                        super.onCompleted(gestureDescription)
-                        Log.i(tag, "gesture completed")
-                    }
-
-                    override fun onCancelled(gestureDescription: GestureDescription?) {
-                        super.onCancelled(gestureDescription)
-                        Log.i(tag, "gesture cancelled")
-                    }
-                }
-
-                val ok = dispatchGesture(desc, cb, null)
-                Log.i(tag, "gesture dispatched? $ok")
-            }
+            do touch() while (sleep())
             Log.i(tag, "injector stopped")
         }
+    }
+
+    private fun touch() {
+        val desc = GestureDescription.Builder().apply {
+            addStroke(
+                GestureDescription.StrokeDescription(
+                    Path().apply { moveTo(0F, 0F) },
+                    0,
+                    1,
+                )
+            )
+        }.build()
+
+        val cb = object : GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) {
+                super.onCompleted(gestureDescription)
+                Log.i(tag, "gesture completed")
+            }
+
+            override fun onCancelled(gestureDescription: GestureDescription?) {
+                super.onCancelled(gestureDescription)
+                Log.i(tag, "gesture cancelled")
+            }
+        }
+
+        val ok = dispatchGesture(desc, cb, null)
+        Log.i(tag, "gesture dispatched? $ok")
     }
 }
